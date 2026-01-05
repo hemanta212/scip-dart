@@ -25,6 +25,10 @@ class ScipVisitor extends GeneralizingAstVisitor {
   final List<Occurrence> occurrences = [];
   final List<SymbolInformation> symbols = [];
 
+  /// Stack of enclosing declarations (functions, methods, classes) for tracking call sites.
+  /// The top of the stack is the innermost enclosing scope.
+  final List<AstNode> _enclosingScopes = [];
+
   ScipVisitor(
     this._relativePath,
     this._projectRoot,
@@ -48,18 +52,34 @@ class ScipVisitor extends GeneralizingAstVisitor {
 
   @override
   void visitNode(AstNode node) {
-    // [visitDeclaration] on the [GeneralizingAstVisitor] does not match parameters
-    // even though the parameter node extends [Declaration]. This is a workaround
-    // to correctly parse all [Declaration] ast nodes.
-    if (node is Declaration) {
-      _visitDeclaration(node);
-    } else if (node is NormalFormalParameter) {
-      _visitNormalFormalParameter(node);
-    } else if (node is SimpleIdentifier) {
-      _visitSimpleIdentifier(node);
+    // Track enclosing scopes for call graph support (enclosingRange on references)
+    final isScope = node is FunctionDeclaration ||
+        node is MethodDeclaration ||
+        node is ConstructorDeclaration ||
+        node is FunctionExpression;
+
+    if (isScope) {
+      _enclosingScopes.add(node);
     }
 
-    super.visitNode(node);
+    try {
+      // [visitDeclaration] on the [GeneralizingAstVisitor] does not match parameters
+      // even though the parameter node extends [Declaration]. This is a workaround
+      // to correctly parse all [Declaration] ast nodes.
+      if (node is Declaration) {
+        _visitDeclaration(node);
+      } else if (node is NormalFormalParameter) {
+        _visitNormalFormalParameter(node);
+      } else if (node is SimpleIdentifier) {
+        _visitSimpleIdentifier(node);
+      }
+
+      super.visitNode(node);
+    } finally {
+      if (isScope) {
+        _enclosingScopes.removeLast();
+      }
+    }
   }
 
   void _visitDeclaration(Declaration node) {
@@ -122,6 +142,9 @@ class ScipVisitor extends GeneralizingAstVisitor {
   ///
   /// If [element] exists outside of the projects source, it will be added to the
   /// [globalExternalSymbols].
+  ///
+  /// When an enclosing scope (function, method, constructor) is available,
+  /// the [enclosingRange] is set to enable call graph analysis.
   void _registerAsReference(
     Element element,
     AstNode node, {
@@ -131,10 +154,19 @@ class ScipVisitor extends GeneralizingAstVisitor {
     final symbol = _symbolGenerator.symbolFor(element);
     if (symbol != null) {
       final meta = getSymbolMetadata(element, offset, _analysisErrors);
+
+      // Compute enclosingRange from the innermost enclosing scope if available
+      List<int>? enclosingRange;
+      if (_enclosingScopes.isNotEmpty) {
+        final enclosingNode = _enclosingScopes.last;
+        enclosingRange = _lineInfo.getRange(enclosingNode.offset, enclosingNode.length);
+      }
+
       occurrences.add(Occurrence(
         range: _lineInfo.getRange(offset, length),
         symbol: symbol,
         diagnostics: meta.diagnostics,
+        enclosingRange: enclosingRange,
       ));
 
       if (!element.source!.fullName.startsWith(_projectRoot)) {
